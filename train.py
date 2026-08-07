@@ -42,6 +42,10 @@ def main():
     # saving splits for reproducibility
     split_path = "/home/ucl/cp3/zdaher/POCA_NET/muon-tomography-ml/datasets/splits/default_split.json"
 
+    # Always load HDF5 data/cache
+    data_module.prepare(normalize=normalize)
+
+
     if os.path.exists(split_path):
 
         print(f"Loading split from {split_path}")
@@ -53,17 +57,15 @@ def main():
         data_module.val_indices = split["val"]
         data_module.test_indices = split["test"]
 
+
     else:
 
-        print("Creating new split")
+        print("Saving new split")
 
         os.makedirs(
             os.path.dirname(split_path),
             exist_ok=True
         )
-
-        # prepare() already creates the splits
-        data_module.prepare(normalize=normalize)
 
         with open(split_path, "w") as f:
             json.dump(
@@ -75,9 +77,6 @@ def main():
                 f,
                 indent=4
             )
-
-
-    # data_module.prepare(normalize=normalize)
 
     train_dataset, val_dataset, test_dataset = (
         data_module.create_datasets(
