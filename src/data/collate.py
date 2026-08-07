@@ -2,7 +2,7 @@ from torch.nn.utils.rnn import pad_sequence
 import torch
 
 
-def collate_poca_batch(batch):
+def collate_poca_batch(batch, voxel_shape=None):
 
     features = [
         item["features"]
@@ -10,9 +10,10 @@ def collate_poca_batch(batch):
     ]
 
     targets = [
-        item["target"].float()
+        item["target"].view(*voxel_shape)
         for item in batch
     ]
+
     material_ids = [
         item["material_id"]
         for item in batch

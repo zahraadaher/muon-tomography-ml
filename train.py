@@ -2,6 +2,7 @@ import os
 import argparse
 import json
 import torch
+import partial
 
 from src.params import ExperimentParams
 
@@ -70,6 +71,12 @@ def main():
         params.train.loss
     )
 
+    ### colate function ###
+    collate_fn = partial(
+        collate_poca_batch,
+        voxel_shape=metadata["voxel_shape"]
+    )
+
     ### training ###
 
     trainer = Trainer(
@@ -78,7 +85,7 @@ def main():
         train_config=params.train,
         output_dir=out_dir,
         device=device,
-        collate_fn=collate_poca_batch
+        collate_fn=collate_fn
     )
 
     train_losses, val_losses = trainer.fit(
