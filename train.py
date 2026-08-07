@@ -2,7 +2,7 @@ import os
 import argparse
 import json
 import torch
-import partial
+from functools import partial
 
 from src.params import ExperimentParams
 
