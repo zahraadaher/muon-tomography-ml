@@ -28,7 +28,7 @@ def main():
     )
     print(f"Outputs will be saved to: {out_dir}")
 
-    # 1. Load Parameters
+    # loading experiment parameters
     print(f"Loading parameters from {args.config}...")
     params = ExperimentParams.from_json(args.config)
     
@@ -38,7 +38,46 @@ def main():
     # setting up data module
     normalize = params.data.normalize_features
     data_module = get_dataset(config=params.data)
-    data_module.prepare(normalize=normalize)
+
+    # saving splits for reproducibility
+    split_path = "/home/ucl/cp3/zdaher/POCA_NET/muon-tomography-ml/datasets/splits/default_split.json"
+
+    if os.path.exists(split_path):
+
+        print(f"Loading split from {split_path}")
+
+        with open(split_path, "r") as f:
+            split = json.load(f)
+
+        data_module.train_indices = split["train"]
+        data_module.val_indices = split["val"]
+        data_module.test_indices = split["test"]
+
+    else:
+
+        print("Creating new split")
+
+        os.makedirs(
+            os.path.dirname(split_path),
+            exist_ok=True
+        )
+
+        # prepare() already creates the splits
+        data_module.prepare(normalize=normalize)
+
+        with open(split_path, "w") as f:
+            json.dump(
+                {
+                    "train": data_module.train_indices,
+                    "val": data_module.val_indices,
+                    "test": data_module.test_indices
+                },
+                f,
+                indent=4
+            )
+
+
+    # data_module.prepare(normalize=normalize)
 
     train_dataset, val_dataset, test_dataset = (
         data_module.create_datasets(
