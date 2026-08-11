@@ -4,13 +4,15 @@ import torch
 
 def collate_poca_batch(batch, voxel_shape=None):
 
+    C, H, W = voxel_shape
+     
     features = [
         item["features"]
         for item in batch
     ]
 
-    targets = [
-        item["target"].view(*voxel_shape)
+    targets = [ 
+        item["target"].view(C, H, W).permute(1, 2, 0)
         for item in batch
     ]
 
