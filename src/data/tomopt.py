@@ -1,5 +1,6 @@
 from locale import normalize
 import logging
+import numpy as np
 
 from .base import BaseDataModule
 from .readers.hdf5_reader import HDF5Reader
@@ -28,15 +29,54 @@ class TomOptDataModule(BaseDataModule):
         self.val_indices = None
         self.test_indices = None
 
+        # number of sampled points
+        self.n_points = 20000
+
     def prepare(self, normalize=False):
+
+        # fix random seed for reproducibility of sampled poca events
+        rng = np.random.default_rng(seed=42)
 
         # Load data cache
         logging.info("Preparing dataset")
         for name in self.reader.list_samples():
 
-            self.cached_data[name] = (
-                self.reader.get_sample(name)
+            # self.cached_data[name] = (
+            #     self.reader.get_sample(name)
+            # )
+            sample = self.reader.get_sample(name)
+
+            features = sample["features"]
+
+            # sampling points inside the voi
+            xyz = features[:, :3]  # poca x,y,z
+
+            xmin, ymin, zmin = self.get_metadata()["voxel_origin"]
+            voxel_dims = self.get_metadata()["voxel_shape"]
+            voxel_size = self.get_metadata()["voxel_size"]
+            xmax = xmin + voxel_dims[0] * voxel_size
+            ymax = ymin + voxel_dims[1] * voxel_size
+            zmax = zmin + voxel_dims[2] * voxel_size
+
+            inside = (
+                (xyz[:, 0] >= xmin) & (xyz[:, 0] <= xmax) &
+                (xyz[:, 1] >= ymin) & (xyz[:, 1] <= ymax) &
+                (xyz[:, 2] >= zmin) & (xyz[:, 2] <= zmax)
             )
+
+            features = features[inside]
+
+            N = len(features)
+
+            if N >= self.n_points:
+                idx = rng.choice(N, self.n_points, replace=False)
+            else:
+                idx = rng.choice(N, self.n_points, replace=True)
+
+            sample["features"] = features[idx]
+
+            self.cached_data[name] = sample
+            
         logging.info(
             f"Loaded {len(self.cached_data)} samples"
         )
