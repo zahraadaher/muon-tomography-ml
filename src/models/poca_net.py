@@ -93,43 +93,90 @@ class POCA_NET(nn.Module):
 
         poca_tensor = poca_tensor[:, :, :8]
 
-        # --- Spatial filter: keep only muons inside voxelized volume ---
-        xmin = self.voxel_centers[:, 0].min() - self.radius
-        xmax = self.voxel_centers[:, 0].max() + self.radius
-        ymin = self.voxel_centers[:, 1].min() - self.radius
-        ymax = self.voxel_centers[:, 1].max() + self.radius
-        zmin = self.voxel_centers[:, 2].min() - self.radius
-        zmax = self.voxel_centers[:, 2].max() + self.radius
 
-        xyz = poca_tensor[:, :, :3]  # (B, N, 3)
-        inbox = (
-            (xyz[:, :, 0] >= xmin) & (xyz[:, :, 0] <= xmax) &
-            (xyz[:, :, 1] >= ymin) & (xyz[:, :, 1] <= ymax) &
-            (xyz[:, :, 2] >= zmin) & (xyz[:, :, 2] <= zmax) &
-            point_mask
-        )  # (B, N)
+        K_actual = poca_tensor.shape[1]
 
-        # --- Subsample to top-K by |theta| per sample ---
-        theta = poca_tensor[:, :, 6]  # (B, N)
-        theta_masked = theta.abs() * inbox.float()  # zero out out-of-volume points
+        # keep only muons inside voxelized volume
+        # xmin = self.voxel_centers[:, 0].min() - self.radius
+        # xmax = self.voxel_centers[:, 0].max() + self.radius
+        # ymin = self.voxel_centers[:, 1].min() - self.radius
+        # ymax = self.voxel_centers[:, 1].max() + self.radius
+        # zmin = self.voxel_centers[:, 2].min() - self.radius
+        # zmax = self.voxel_centers[:, 2].max() + self.radius
 
-        K_actual = min(K, inbox.sum(dim=1).min().item())  # guard if fewer than K in-volume
-        topk_idx = torch.topk(theta_masked, K_actual, dim=1).indices  # (B, K)
+        # xyz = poca_tensor[:, :, :3]  # (B, N, 3)
+        # inbox = (
+        #     (xyz[:, :, 0] >= xmin) & (xyz[:, :, 0] <= xmax) &
+        #     (xyz[:, :, 1] >= ymin) & (xyz[:, :, 1] <= ymax) &
+        #     (xyz[:, :, 2] >= zmin) & (xyz[:, :, 2] <= zmax) &
+        #     point_mask
+        # )  # (B, N)
 
-        # Gather selected points
-        topk_idx_exp = topk_idx.unsqueeze(-1).expand(B, K_actual, 8)
-        poca_sel = torch.gather(poca_tensor, 1, topk_idx_exp)  # (B, K, 8)
+        # sample to top-K by |theta| per sample
+        # # theta = poca_tensor[:, :, 6]  # (B, N)
+        # # theta_masked = theta.abs() * inbox.float()  # zero out out-of-volume points
 
-        # --- Point MLP ---
-        poca_flat = poca_sel.reshape(B * K_actual, 8)
+        # # K_actual = min(K, inbox.sum(dim=1).min().item())  # guard if fewer than K in-volume
+        # # topk_idx = torch.topk(theta_masked, K_actual, dim=1).indices  # (B, K)
+
+        # # # Gather selected points
+        # # topk_idx_exp = topk_idx.unsqueeze(-1).expand(B, K_actual, 8)
+        # # poca_sel = torch.gather(poca_tensor, 1, topk_idx_exp)  # (B, K, 8)
+
+        # Fixed-size random sampling inside volume 
+        # K = 10000
+
+        # poca_sel_list = []
+
+        # for b in range(B):
+
+        #     valid_idx = torch.where(inbox[b])[0]
+
+        #     n_valid = len(valid_idx)
+
+        #     if n_valid >= K:
+        #         # random sample without replacement
+        #         sampled_idx = valid_idx[
+        #             torch.randperm(n_valid, device=device)[:K]
+        #         ]
+
+        #     else:
+        #         # use all available points + repeat to reach K
+        #         extra_idx = valid_idx[
+        #             torch.randint(
+        #                 0,
+        #                 n_valid,
+        #                 (K - n_valid,),
+        #                 device=device
+        #             )
+        #         ]
+
+        #         sampled_idx = torch.cat(
+        #             [valid_idx, extra_idx],
+        #             dim=0
+        #         )
+
+        #     poca_sel_list.append(
+        #         poca_tensor[b, sampled_idx]
+        #     )
+
+        # poca_sel = torch.stack(
+        #     poca_sel_list,
+        #     dim=0
+        # )  # (B, K, 8)
+
+        # K_actual = K
+
+        # point MLP
+        poca_flat = poca_tensor.reshape(B * K_actual, 8)
         muon_feats = self.point_mlp(poca_flat)                          # (B*K, C)
         raw_scores = self.attn_score(muon_feats).squeeze(-1)            # (B*K,)
 
         muon_feats = muon_feats.view(B, K_actual, C)                    # (B, K, C)
         raw_scores = raw_scores.view(B, K_actual)                       # (B, K)
 
-        # --- Batched attention via broadcasting (no loop) ---
-        xyz_sel = poca_sel[:, :, :3]                                    # (B, K, 3)
+        # Batched attention via broadcasting
+        xyz_sel = poca_tensor[:, :, :3]                                    # (B, K, 3)
 
         diff = self.voxel_centers[None, :, None, :] - xyz_sel[:, None, :, :]  # (B, V, K, 3)
         dists = diff.norm(dim=-1)                                              # (B, V, K)
