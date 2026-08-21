@@ -17,8 +17,8 @@ class TomOptDataModule(BaseDataModule):
         hdf5_path: str,
         split_config: str,
         in_memory: bool=True,
-        n_points = 20000,
-        normalize = False
+        n_points: int = 20000,
+        normalize:bool = False
     ):
 
         self.reader = HDF5Reader(hdf5_path)
