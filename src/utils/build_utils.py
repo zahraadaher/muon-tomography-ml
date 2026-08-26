@@ -7,7 +7,7 @@ import h5py
 import torch
 
 from src.params import ExperimentParams
-from src.models.poca_net_unet import POCA_NET_UNET
+from src.models.poca_net import POCA_NET_UNET
 from src.models.unet import UNetVoxelX0InferNet
 from src.data.base import BaseDataModule
 from src.data.tomopt import TomOptDataModule
@@ -36,7 +36,7 @@ def build_data_module(
     
     params = ExperimentParams.from_json(config_json)
     normalize = params.data.normalize_features
-    data_module = get_dataset(config=params.data, n_points=n_points, normalize = normalize)
+    data_module = get_dataset(config=params.data, n_points=n_points, normalize = normalize, in_memory = params.data.in_memory)
     data_module.prepare()
 
     return data_module
