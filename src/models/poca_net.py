@@ -1,198 +1,457 @@
 import torch
 import torch.nn as nn
 from torch import Tensor
+import torch.nn.functional as F
+
+from .unet import UNet3D
 
 
-class POCA_NET(nn.Module):
-    """
-    Neural network for local feature aggregation of 3D muon PoCA points
-    into voxel-wise predictions, using attention-based pooling.
+class POCA_NET_UNET(nn.Module):
+    r"""
+    Reconstructs voxel-wise scattering densities from PoCA point clouds.
 
-    Each voxel aggregates features from nearby PoCA points within a radius,
-    using a learned attention score. The final output is a scalar prediction
-    per voxel, reshaped into a 3D grid. Note that the output is not constrained to be positive, allowing the model to learn log(X0) 
-    since X0 can span orders of magnitude across materials.
+    The model consists of two stages. First, the spatial and scattering
+    features of individual PoCA points are encoded using a shared point
+    MLP. The resulting point features are then aggregated into a regular
+    voxel grid using a learned per-point attention score combined with
+    Gaussian spatial weighting.
+
+    Two voxelization schemes are supported:
+
+    - ``"gaus_full"``: each PoCA point contributes to all voxels according
+      to a Gaussian spatial kernel.
+    - ``"gaus3"``: each PoCA point contributes only to a local
+      ``(2 * offset_radius + 1)^3`` voxel stencil.
+
+    The aggregated 16-dimensional learned voxel representation is
+    concatenated with a logarithmic evidence channel and passed to a
+    3D U-Net. The U-Net produces a single voxel-wise prediction of the
+    scattering density.
 
     Args:
-        voxel_centers (Tensor): (V, 3) coordinates of voxel centers.
-        voxel_shape (tuple): (X Y Z) shape of the output 3D grid.
-        radius (float): Radius (in meters) around each voxel cemter to aggregate points from.
+        voxel_centers (Tensor):
+            Tensor containing the 3D coordinates of the voxel centers,
+            with shape ``(X * Y * Z, 3)``.
+
+        voxel_shape (tuple):
+            Number of voxels along the three spatial dimensions,
+            specified as ``(X, Y, Z)``.
+
+        radius (float, optional):
+            Characteristic radius of the Gaussian spatial weighting.
+            The Gaussian standard deviation is set to ``radius / 2``.
+            Defaults to ``0.1``.
+
+        feat_mean (Tensor, optional):
+            Mean values used to normalize the eight input PoCA features.
+            If ``None``, a zero vector is used.
+
+        feat_std (Tensor, optional):
+            Standard deviations used to normalize the eight input PoCA
+            features. If ``None``, a unit vector is used.
+
+        offset_radius (int, optional):
+            Radius of the local voxel stencil used by the ``"gaus3"``
+            voxelizer. For example, ``offset_radius=1`` corresponds to
+            a ``3 x 3 x 3`` stencil. Defaults to ``1``.
+
+        voxelizer_type (str, optional):
+            Voxelization scheme to use. Must be either ``"gaus_full"``
+            or ``"gaus3``. Defaults to ``"gaus_full"``.
+
+    Input:
+        poca_tensor (Tensor):
+            PoCA point features with shape ``(B, N, F)``.
+
+        point_mask (Tensor, optional):
+            Boolean mask from the DataLoader collate function with
+            shape ``(B, N)`` indicating valid PoCA points. If ``None``, 
+            all points are treated as valid.
+
+    Output:
+        Tensor:
+            Voxel-wise predicted scattering densities with shape
+            ``(B, X, Y, Z)``.
     """
-    
+
     def __init__(
         self,
         voxel_centers: Tensor,
         voxel_shape: tuple,
-        radius: float = 0.2
+        radius: float = 0.1,
+        feat_mean: Tensor = None,
+        feat_std: Tensor = None,
+        offset_radius: int = 1,
+        voxelizer_type: str = 'gaus_full'
     ):
         super().__init__()
-        self.register_buffer('voxel_centers', voxel_centers)
+
+        X, Y, Z = voxel_shape
+        assert voxel_centers.shape[0] == X * Y * Z, (
+            f"voxel_centers has {voxel_centers.shape[0]} rows, "
+            f"expected X*Y*Z = {X * Y * Z}"
+        )
+
+        self.register_buffer("voxel_centers", voxel_centers)
         self.voxel_shape = voxel_shape
         self.n_voxels = voxel_centers.shape[0]
         self.radius = radius
-    
- 
-        # normalizing voxel centers when concatenating
-        vc = voxel_centers
-        self.register_buffer('voxel_centers_norm', 
-            (vc - vc.mean(dim=0)) / (vc.std(dim=0) + 1e-8))
+        self.stencil_r = offset_radius
+        self.voxelizer_type = voxelizer_type
 
-        # Processes each POCA point's features
+        if self.voxelizer_type == "gaus3":
+            centers_grid = voxel_centers.view(
+                X, Y, Z, 3
+            )
+            step_x = (
+                centers_grid[1, 0, 0]
+                - centers_grid[0, 0, 0]
+            )
+            step_y = (
+                centers_grid[0, 1, 0]
+                - centers_grid[0, 0, 0]
+            )
+            step_z = (
+                centers_grid[0, 0, 1]
+                - centers_grid[0, 0, 0]
+            )
+            pitch = torch.stack([
+                step_x.norm(),
+                step_y.norm(),
+                step_z.norm(),
+            ])
+            self.register_buffer(
+                "voxel_pitch",
+                pitch
+            )
+            self.register_buffer(
+                "origin",
+                centers_grid[0, 0, 0].clone()
+            )
+
+            r = self.stencil_r
+
+            offsets = torch.stack(
+                torch.meshgrid(
+                    torch.arange(-r, r + 1),
+                    torch.arange(-r, r + 1),
+                    torch.arange(-r, r + 1),
+                    indexing="ij",
+                ),
+                dim=-1,
+            ).reshape(-1, 3)
+
+            self.register_buffer(
+                "stencil_offsets",
+                offsets
+            )
+
+        # Feature statistics
+
+        if feat_mean is None:
+            feat_mean = torch.zeros(8)
+        if feat_std is None:
+            feat_std = torch.ones(8)
+
+        self.register_buffer("feat_mean", feat_mean)
+        self.register_buffer("feat_std", feat_std)
+
+        # Point encoder
+
         self.point_mlp = nn.Sequential(
             nn.Linear(8, 16),
-            #nn.GroupNorm(4, 16),
-            nn.LayerNorm(16),
             nn.ReLU(),
-            nn.Dropout(p=0.05),  # Reduced dropout
-            nn.Linear(16, 16),   # Smaller hidden size
-            # nn.GroupNorm(4, 16),
-            nn.LayerNorm(16),
+            nn.Linear(16, 16),
             nn.ReLU(),
         )
 
-        # Processes aggregated voxel features 
-        self.voxel_mlp = nn.Sequential(
-            nn.Linear(16 + 3, 256),
-            #nn.GroupNorm(4, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(256, 128),
-            #nn.GroupNorm(4, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            #nn.Dropout(p=0.1),
-            nn.Linear(128, 1),
-            #nn.Softplus()  # predict log(X0)
-        )
+        # Learned point scalar attention score
 
-        # Attention mechanism to score each point
         self.attn_score = nn.Linear(16, 1)
-        
-        self._initialize_weights() 
-        
-    def _initialize_weights(self) -> None: 
-        """
-        Xavier initialization for linear layers.
-        """
-        for m in self.modules(): 
-            if isinstance(m, nn.Linear): 
-                torch.nn.init.xavier_uniform_(m.weight) 
-                if m.bias is not None: torch.nn.init.constant_(m.bias, 0) 
-        
+
+      
+        # UNet
+
+        self.unet = UNet3D(in_channels=17, base=32)
+
+    def pad_to_unet(self, x):
+        B, C, X, Y, Z = x.shape
+        pad_x = (4 - X % 4) % 4
+        pad_y = (4 - Y % 4) % 4
+        pad_z = (4 - Z % 4) % 4
+        return F.pad(x, (0, pad_z, 0, pad_y, 0, pad_x))
 
     def forward(self, poca_tensor, point_mask=None):
+
         B, N, _ = poca_tensor.shape
+        X, Y, Z = self.voxel_shape
         V = self.n_voxels
-        C = 16  # point_mlp output dim
-        K = 10000
         device = poca_tensor.device
 
         if point_mask is None:
             point_mask = torch.ones(B, N, dtype=torch.bool, device=device)
 
+        # Extracting the 8 PoCA features
+
         poca_tensor = poca_tensor[:, :, :8]
+        K = poca_tensor.shape[1]
 
+        
+        # Input feature standardization
+        poca_norm = (poca_tensor - self.feat_mean) / (self.feat_std + 1e-8)
+        poca_flat = poca_norm.reshape(B * K, 8)
 
-        K_actual = poca_tensor.shape[1]
+        #feature encoding
+        muon_feats = self.point_mlp(poca_flat).view(B, K, 16)
 
-        # keep only muons inside voxelized volume
-        # xmin = self.voxel_centers[:, 0].min() - self.radius
-        # xmax = self.voxel_centers[:, 0].max() + self.radius
-        # ymin = self.voxel_centers[:, 1].min() - self.radius
-        # ymax = self.voxel_centers[:, 1].max() + self.radius
-        # zmin = self.voxel_centers[:, 2].min() - self.radius
-        # zmax = self.voxel_centers[:, 2].max() + self.radius
+        # Global per-point attention
+        raw_scores = self.attn_score(muon_feats).squeeze(-1)  # (B, K)
+        
+        if self.voxelizer_type == "gaus_full":
 
-        # xyz = poca_tensor[:, :, :3]  # (B, N, 3)
-        # inbox = (
-        #     (xyz[:, :, 0] >= xmin) & (xyz[:, :, 0] <= xmax) &
-        #     (xyz[:, :, 1] >= ymin) & (xyz[:, :, 1] <= ymax) &
-        #     (xyz[:, :, 2] >= zmin) & (xyz[:, :, 2] <= zmax) &
-        #     point_mask
-        # )  # (B, N)
+            # each PoCA point contributes to all voxels according 
+            # to a Gaussian spatial kernel.
 
-        # sample to top-K by |theta| per sample
-        # # theta = poca_tensor[:, :, 6]  # (B, N)
-        # # theta_masked = theta.abs() * inbox.float()  # zero out out-of-volume points
+            xyz_sel = poca_tensor[:, :, :3]  # spatial features
 
-        # # K_actual = min(K, inbox.sum(dim=1).min().item())  # guard if fewer than K in-volume
-        # # topk_idx = torch.topk(theta_masked, K_actual, dim=1).indices  # (B, K)
+            diff = (
+                self.voxel_centers[None, :, None, :]
+                - xyz_sel[:, None, :, :]
+            )
 
-        # # # Gather selected points
-        # # topk_idx_exp = topk_idx.unsqueeze(-1).expand(B, K_actual, 8)
-        # # poca_sel = torch.gather(poca_tensor, 1, topk_idx_exp)  # (B, K, 8)
+            dists = diff.norm(dim=-1)
 
-        # Fixed-size random sampling inside volume 
-        # K = 10000
+            sigma = self.radius / 2
 
-        # poca_sel_list = []
+            weights = torch.exp(
+                -dists**2 /
+                (2 * sigma**2)
+            )
 
-        # for b in range(B):
+            weights = (
+                weights
+                * point_mask[:, None, :].float()
+            )
 
-        #     valid_idx = torch.where(inbox[b])[0]
+            # Global attention over points
+            raw_scores_V = (
+                raw_scores[:, None, :]
+                .expand(B, V, K)
+            )
 
-        #     n_valid = len(valid_idx)
+            alpha = torch.softmax(
+                raw_scores_V,
+                dim=-1
+            )
 
-        #     if n_valid >= K:
-        #         # random sample without replacement
-        #         sampled_idx = valid_idx[
-        #             torch.randperm(n_valid, device=device)[:K]
-        #         ]
+            alpha = alpha * weights
 
-        #     else:
-        #         # use all available points + repeat to reach K
-        #         extra_idx = valid_idx[
-        #             torch.randint(
-        #                 0,
-        #                 n_valid,
-        #                 (K - n_valid,),
-        #                 device=device
-        #             )
-        #         ]
+            alpha = alpha / (
+                alpha.sum(
+                    dim=-1,
+                    keepdim=True
+                ) + 1e-8
+            )
 
-        #         sampled_idx = torch.cat(
-        #             [valid_idx, extra_idx],
-        #             dim=0
-        #         )
+            # Learned voxel features
+            agg_feat = torch.einsum(
+                "bvk,bkc->bvc",
+                alpha,
+                muon_feats
+            )
 
-        #     poca_sel_list.append(
-        #         poca_tensor[b, sampled_idx]
-        #     )
+            # Evidence
+            evidence = weights.sum(
+                dim=-1,
+                keepdim=True
+            )
 
-        # poca_sel = torch.stack(
-        #     poca_sel_list,
-        #     dim=0
-        # )  # (B, K, 8)
+        elif self.voxelizer_type == "gaus3":
 
-        # K_actual = K
+            # 3x3x3 local stencil aggregation
 
-        # point MLP
-        poca_flat = poca_tensor.reshape(B * K_actual, 8)
-        muon_feats = self.point_mlp(poca_flat)                          # (B*K, C)
-        raw_scores = self.attn_score(muon_feats).squeeze(-1)            # (B*K,)
+            xyz_sel = poca_tensor[:, :, :3]
 
-        muon_feats = muon_feats.view(B, K_actual, C)                    # (B, K, C)
-        raw_scores = raw_scores.view(B, K_actual)                       # (B, K)
+            # Find containing voxel
+            rel = (
+                xyz_sel - self.origin
+            ) / self.voxel_pitch
 
-        # Batched attention via broadcasting
-        xyz_sel = poca_tensor[:, :, :3]                                    # (B, K, 3)
+            base_idx = rel.floor().long()
 
-        diff = self.voxel_centers[None, :, None, :] - xyz_sel[:, None, :, :]  # (B, V, K, 3)
-        dists = diff.norm(dim=-1)                                              # (B, V, K)
+            # Candidate voxels
+            S = self.stencil_offsets.shape[0]
 
-        sigma = self.radius / 2
-        weights = torch.exp(-dists**2 / (2 * sigma**2))                       # (B, V, K)
-        raw_scores_V = raw_scores[:, None, :].expand(B, V, K_actual)          # (B, V, K)
-        raw_scores_V = raw_scores_V + torch.log(weights + 1e-8)
-        alpha = torch.softmax(raw_scores_V, dim=-1)                           # (B, V, K)
+            cand_idx = (
+                base_idx[:, :, None, :]
+                + self.stencil_offsets[None, None, :, :]
+            )
 
-        # alpha: (B, V, K),  muon_feats: (B, K, C)
-        agg_feat = torch.einsum('bvk,bkc->bvc', alpha, muon_feats)     # (B, V, C)
+            shape_t = torch.tensor(
+                [X, Y, Z],
+                device=device,
+                dtype=torch.long
+            )
 
-        vc_norm = self.voxel_centers_norm[None].expand(B, -1, -1)      # (B, V, 3)
-        voxel_input = torch.cat([agg_feat, vc_norm], dim=-1)           # (B, V, C+3)
-        voxel_out = self.voxel_mlp(voxel_input)                        # (B, V, 1)
+            valid = (
+                (cand_idx >= 0)
+                & (cand_idx < shape_t)
+            ).all(dim=-1)
 
-        return voxel_out.squeeze(-1).view(B, *self.voxel_shape)        # (B, X, Y, Z)
-            
+            # Clamp only for safe indexing
+            cand_idx_clamped = cand_idx.clone()
+
+            cand_idx_clamped[..., 0] = cand_idx_clamped[..., 0].clamp(
+                0, X - 1
+            )
+
+            cand_idx_clamped[..., 1] = cand_idx_clamped[..., 1].clamp(
+                0, Y - 1
+            )
+
+            cand_idx_clamped[..., 2] = cand_idx_clamped[..., 2].clamp(
+                0, Z - 1
+            )
+
+            flat_vidx = (
+                cand_idx_clamped[..., 0] * (Y * Z)
+                + cand_idx_clamped[..., 1] * Z
+                + cand_idx_clamped[..., 2]
+            )
+
+            # Gaussian weights
+            vcenters = self.voxel_centers[
+                flat_vidx
+            ]
+
+            dists = (
+                vcenters
+                - xyz_sel[:, :, None, :]
+            ).norm(dim=-1)
+
+            sigma = self.radius / 2
+
+            weights = torch.exp(
+                -dists**2 /
+                (2 * sigma**2)
+            )
+
+            weights = (
+                weights
+                * valid.float()
+                * point_mask[:, :, None].float()
+            )
+
+            # Combine attention + spatial weight
+            alpha = (
+                torch.softmax(
+                    raw_scores,
+                    dim=1
+                )
+            )
+
+            edge_alpha = (
+                alpha[:, :, None]
+                * weights
+            )
+
+            # Flatten edges
+            b_idx = torch.arange(
+                B,
+                device=device
+            )[:, None, None].expand(
+                B, K, S
+            )
+
+            flat_edge_vidx = (
+                b_idx * V + flat_vidx
+            ).reshape(-1)
+
+            edge_alpha_flat = (
+                edge_alpha.reshape(-1)
+            )
+
+            # Normalize aggregation weights
+            denom = torch.zeros(
+                B * V,
+                device=device,
+                dtype=edge_alpha_flat.dtype
+            )
+
+            denom.index_add_(
+                0,
+                flat_edge_vidx,
+                edge_alpha_flat
+            )
+
+            edge_alpha_norm = (
+                edge_alpha_flat
+                / (
+                    denom[flat_edge_vidx]
+                    + 1e-8
+                )
+            )
+
+            # Aggregate learned features
+            feat_edges = (
+                muon_feats[:, :, None, :]
+                * edge_alpha_norm.view(
+                    B, K, S, 1
+                )
+            ).reshape(-1, 16)
+
+            agg_feat = torch.zeros(
+                B * V,
+                16,
+                device=device,
+                dtype=feat_edges.dtype
+            )
+
+            agg_feat.index_add_(
+                0,
+                flat_edge_vidx,
+                feat_edges
+            )
+
+            agg_feat = agg_feat.view(
+                B, V, 16
+            )
+
+            # Evidence
+            evidence = torch.zeros(
+                B * V,
+                device=device,
+                dtype=weights.dtype
+            )
+
+            evidence.index_add_(
+                0,
+                flat_edge_vidx,
+                weights.reshape(-1)
+            )
+
+            evidence = evidence.view(
+                B, V, 1
+            )
+
+        else:
+            raise RuntimeError(
+                f"Unknown voxelizer_type: {self.voxelizer_type}"
+            )
+        
+        evidence = torch.log1p(evidence).view(B, V, 1)
+
+        # Learned voxel representation -> (B,C,X,Y,Z)
+    
+        voxel_input = torch.cat([agg_feat, evidence], dim=-1)   # (B, V, 17)
+        voxel_input = voxel_input.view(B, X, Y, Z, 17)
+        voxel_input = voxel_input.permute(0, 4, 1, 2, 3).contiguous()
+
+        # Passing to UNet
+
+        voxel_input = self.pad_to_unet(voxel_input)
+        out = self.unet(voxel_input)
+        out = out.squeeze(1)
+        out = out[:, :X, :Y, :Z]
+
+        return out
