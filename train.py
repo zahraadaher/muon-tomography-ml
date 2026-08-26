@@ -6,12 +6,12 @@ from functools import partial
 
 from src.params import ExperimentParams
 
-from src.data.factory import get_dataset
-from src.utils.geometry_tomopt import get_voxel_centers
-from src.models.factory import get_model
 from src.loss.factory import get_loss
 from src.train.trainer import Trainer
 from src.data.collate import collate_poca_batch
+from src.utils.build_utils import build_data_module
+from src.utils.build_utils import set_data_splits
+from src.utils.build_utils import build_model
 
 
 def main():
@@ -35,38 +35,30 @@ def main():
     device = torch.device(params.model.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # setting up data module
-    normalize = params.data.normalize_features
-    data_module = get_dataset(config=params.data)
-
     # saving splits for reproducibility
     split_path = "/home/ucl/cp3/zdaher/POCA_NET/muon-tomography-ml/datasets/splits/default_split.json"
 
-    # Always load HDF5 data/cache
-    data_module.prepare(normalize=normalize)
+    #----------------------------------------------------------------------------------------------
+    #---------------------Dataset -----------------------------------------------------------------
 
+    split_path = "/home/ucl/cp3/zdaher/POCA_NET/muon-tomography-ml/datasets/splits/default_split.json"
+
+    # build data module
+    data_module = build_data_module(config_json=args.config, n_points=20000)
 
     if os.path.exists(split_path):
-
+        # extract dataset split indices, also handles feature stats extraction, 
+        # computed using the train dataset
         print(f"Loading split from {split_path}")
-
-        with open(split_path, "r") as f:
-            split = json.load(f)
-
-        data_module.train_indices = split["train"]
-        data_module.val_indices = split["val"]
-        data_module.test_indices = split["test"]
-
+        set_data_splits(data_module=data_module, split_json= split_path)
 
     else:
-
-        print("Saving new split")
-
+        # if no splits are found, uses the generated splits when the data module was created
+        print("Creating new split")
         os.makedirs(
             os.path.dirname(split_path),
             exist_ok=True
         )
-
         with open(split_path, "w") as f:
             json.dump(
                 {
@@ -78,45 +70,38 @@ def main():
                 indent=4
             )
 
-    train_dataset, val_dataset, test_dataset = (
-        data_module.create_datasets(
-            normalize=normalize
-        )
-    )
+    # creating train/val/test datasets
+    train_dataset, val_dataset, test_dataset = data_module.create_datasets()
 
     print("Train size:", len(train_dataset))
     print("Val size:", len(val_dataset))
     print("Test size:", len(test_dataset))
 
-    ### model ### 
 
-    metadata = data_module.get_metadata()
+    #----------------------------------------------------------------------------------------------
+    #---------------------Model ------------------------------------------------------------------- 
 
-    voxel_centers = get_voxel_centers(
-        voxel_shape=metadata["voxel_shape"],
-        voxel_size=metadata["voxel_size"],
-        origin=metadata["voxel_origin"]
-    )
+    model = build_model(config_json=args.config, data_module=data_module)
 
-    model = get_model(
-        params.model,
-        voxel_centers
-    )
-
-    ### loss ###
+    #----------------------------------------------------------------------------------------------
+    #---------------------Loss ------------------------------------------------------------------- 
 
     loss = get_loss(
         params.train.loss
     )
 
-    ### colate function ###
+    #----------------------------------------------------------------------------------------------
+    #---------------------Trainig -----------------------------------------------------------------
+
+    # custom collate function (handles voxel dimension ordering for tomopt data, 
+    # as well as different event number in a batch, since we are dealing with sparse input)
+    metadata = data_module.get_metadata()
     collate_fn = partial(
         collate_poca_batch,
         voxel_shape=metadata["voxel_shape"]
     )
 
-    ### training ###
-
+    # training module
     trainer = Trainer(
         model=model,
         loss_fn=loss,
@@ -133,8 +118,9 @@ def main():
         batch_size=params.train.batch_size
     )
 
-    ### save results ###
-
+    #----------------------------------------------------------------------------------------------
+    #---------------------Saving -----------------------------------------------------------------
+    
     model_path = os.path.join(
         out_dir,
         "best_model.pth"
