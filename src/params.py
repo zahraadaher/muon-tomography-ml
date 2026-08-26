@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Dict
+from typing import Dict
 
 
 @dataclass
@@ -8,6 +8,8 @@ class ModelParams:
     type: str = "poca_net"
     voxel_shape: tuple = (10, 10, 4)
     radius: float = 0.1
+    offset_radius: float = 1
+    voxelizer_type: str = 'hard'
     device: str = "cuda"
 
 
